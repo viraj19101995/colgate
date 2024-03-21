@@ -1,0 +1,103 @@
+import os
+import tempfile
+
+import pandas as pd
+import psycopg2
+from sqlalchemy import create_engine
+from dotenv import load_dotenv
+from sqlalchemy import create_engine
+from sqlalchemy.dialects.postgresql import NUMERIC, UUID, BOOLEAN, VARCHAR, DATE
+
+load_dotenv()
+
+def get_db_connection_params(dbname):
+    return {
+        'dbname': dbname,
+        'user': os.getenv('col_user'),
+        'password': '9QK9rZOdVO_p=ULG',
+        'host': '10.238.3.53',
+        'port': 5432
+    }
+
+def fetch_data_from_db(dbname, query):
+    connection_params = get_db_connection_params(dbname)
+    print("Connection Params:", connection_params)
+    with psycopg2.connect(**connection_params) as con:
+        with con.cursor() as cur:
+            cur.execute(query)
+            rows = cur.fetchall()
+            desc = cur.description
+    df = pd.DataFrame(rows, columns=[desc[0] for desc in desc])
+    return df
+
+def dataframe_to_postgres(df, table_name, conn_params):
+    if 'volume' in df.columns:
+        df['volume'] = pd.to_numeric(df['volume'], errors='coerce').astype('Int64')
+    dtype = {
+        'volume': NUMERIC,
+        'forecast_detail_id': UUID,
+        'forecast_type': VARCHAR,
+        'period': DATE,
+        'value': NUMERIC,
+        'forecast_header_id_fk_id': UUID,
+        'forecast_header_id': UUID,
+        'variability': VARCHAR,
+        'sku_id': VARCHAR,
+        'node_id': VARCHAR,
+        'snop_id': UUID,
+        'channel_id': UUID,
+        'segment': VARCHAR,
+        'adi': NUMERIC,
+        'cv': NUMERIC,
+        'is_re_forecasted': BOOLEAN,
+        'sparsity': VARCHAR,
+        'is_seasonal': BOOLEAN,
+        'fmr': VARCHAR,
+        'node_hierarchy_id': UUID
+    }
+    with tempfile.NamedTemporaryFile(delete=False, mode='w') as tmpfile:
+        df.to_csv(tmpfile.name, index=False, header=False)
+        with psycopg2.connect(**conn_params) as conn:
+            with conn.cursor() as cursor:
+                engine = create_engine(f"postgresql+psycopg2://{conn_params['user']}:{conn_params['password']}@{conn_params['host']}/{conn_params['dbname']}")
+                df.head(0).to_sql(table_name, engine, if_exists='replace', index=False, dtype=dtype)
+
+                cursor.execute(f"TRUNCATE TABLE {table_name}")
+                tmpfile.seek(0)
+                cursor.copy_expert(f"COPY {table_name} FROM STDIN WITH CSV", open(tmpfile.name, 'r'))
+                conn.commit()
+
+
+dbname = 'dpai'
+query1 = "SELECT forecast_header_id,sku_id,node_id,snop_id,channel_id,segment,variability,adi,cv,is_re_forecasted,sparsity,is_seasonal,fmr FROM scai_dpai_8c7e0db5_fdfd_4b81_b892_d75f034923aa.app_forecastheader where snop_id = '84caf0b8-ef26-4fea-a965-2dfa6fb6f07b'"
+query2 = "SELECT forecast_detail_id,forecast_type,period,volume,value,forecast_header_id_fk_id FROM scai_dpai_8c7e0db5_fdfd_4b81_b892_d75f034923aa.app_forecastdetail"
+
+df_header = fetch_data_from_db(dbname, query1)
+df_detail = fetch_data_from_db(dbname, query2)
+df_joined = pd.merge(df_header, df_detail, left_on='forecast_header_id', right_on='forecast_header_id_fk_id')
+
+
+dbname = 'entities'
+query3 = "SELECT A.id As sku_id,A.sku_code,A.sku_description,A.sku_name, C.channel_id, B.sku_mapping_id, C.channel_name FROM sku A INNER JOIN sku_mapping B ON A.id = B.sku_id INNER JOIN channel C ON B.channel_id = C.channel_id where B.bu_id = '028ad113-366a-47d2-803d-cbc6df4b68b7'"
+query4 = "SELECT sku_mapping_id, MAX(CASE WHEN level = 'level1' THEN value END) AS Brand, MAX(CASE WHEN level = 'level2' THEN value END) AS Sub_Brand, MAX(CASE WHEN level = 'level3' THEN value END) AS Sub_Category, MAX(CASE WHEN level = 'level4' THEN value END) AS Category FROM sku_hierarchy GROUP BY sku_mapping_id ORDER BY sku_mapping_id"
+
+df_sku = fetch_data_from_db(dbname, query3)
+df_sku_mapping = fetch_data_from_db(dbname, query4)
+df_sku_all = pd.merge(df_sku, df_sku_mapping, on='sku_mapping_id')
+
+query5 = "SELECT A.id As node_id,A.node,A.node_code,A.node_type_id, B.node_mapping_id FROM node A INNER JOIN node_mapping B ON A.id = B.node_id where B.bu_id = '028ad113-366a-47d2-803d-cbc6df4b68b7'"
+query6 = "SELECT node_mapping_id, MAX(CASE WHEN level = 'level2' THEN value END) AS Country, MAX(CASE WHEN level = 'level1' THEN value END) AS Branch FROM node_hierarchy GROUP BY node_mapping_id ORDER BY node_mapping_id"
+
+df_node = fetch_data_from_db(dbname, query5)
+df_node_mapping = fetch_data_from_db(dbname, query6)
+df_node_all = pd.merge(df_node, df_node_mapping, on='node_mapping_id')
+
+df_sku_join = pd.merge(df_joined, df_sku_all, on=['sku_id', 'channel_id'])
+df_sku_node_join = pd.merge(df_sku_join, df_node_all, on='node_id')
+
+DOMO_DEV_params = get_db_connection_params('DOMO_DEV')
+
+table_name = 'forecast'
+print("df to postgres started")
+dataframe_to_postgres(df_sku_node_join, table_name, DOMO_DEV_params)
+
